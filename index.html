@@ -1,0 +1,894 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Lake POV</title>
+<style>
+  body { margin: 0; overflow: hidden; background: #000; font-family: system-ui, sans-serif; }
+  #llEdge { position: fixed; inset: 0; pointer-events: none; }
+  #hud { position: fixed; top: 10px; left: 10px; color: #fff; background: rgba(0,0,0,.45);
+         padding: 8px 12px; border-radius: 6px; font-size: 13px; line-height: 1.5; pointer-events: none; }
+  #vignette { position: fixed; inset: 0; pointer-events: none;
+              background: radial-gradient(ellipse at center, transparent 55%, rgba(0,0,0,.55) 100%); }
+  #minimap { position: fixed; top: 10px; right: 10px; width: 220px; height: 220px;
+             border-radius: 6px; border: 1px solid rgba(255,255,255,.3); pointer-events: none; }
+  #settings { position: fixed; bottom: 10px; left: 10px; color: #fff; background: rgba(0,0,0,.45);
+              padding: 8px 12px; border-radius: 6px; font-size: 13px; }
+  #settings input { width: 180px; vertical-align: middle; }
+  #msg { position: fixed; top: 40%; left: 0; right: 0; text-align: center; color: #fff; font-size: 28px;
+         font-weight: bold; text-shadow: 0 2px 8px #000; opacity: 0; transition: opacity .3s; pointer-events: none; }
+  #start { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center;
+           color: #fff; font-size: 20px; background: rgba(0,0,0,.5); cursor: pointer; }
+</style>
+</head>
+<body>
+<div id="vignette"></div>
+<canvas id="llEdge"></canvas>
+<div id="hud"></div>
+<canvas id="minimap" width="220" height="220"></canvas>
+<div id="settings">
+  Water clarity: <span id="visLabel"></span><br>
+  <span style="opacity:.7">murky</span>
+  <input id="visSlider" type="range" min="2" max="80" step="1">
+  <span style="opacity:.7">clear</span>
+</div>
+<div id="msg"></div>
+<div id="start">Click to swim</div>
+
+<script type="importmap">
+{ "imports": { "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js" } }
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+
+// ---------------- World settings (tweak these) ----------------
+const CONFIG = {
+  lakeRadiusFt: 200,    // feet, center to shore
+  maxDepthFt: 25,       // feet at the deepest point
+  visibilityFt: 30,     // how far you can see underwater (also set by the slider)
+  waterColor: 0x2f5d4a, // greenish lake water
+  weedCount: 500,
+  rockCount: 60,
+  bluegillCount: 30,
+  bassCount: 6,
+  smartBluegillCount: 6,
+};
+
+// The 3D world runs in meters internally; everything you set or see is in feet.
+const FT = 0.3048; // meters per foot
+const R = CONFIG.lakeRadiusFt * FT;
+const MAX_DEPTH = CONFIG.maxDepthFt * FT;
+
+// ---------------- Species (the "you" options) ----------------
+const SPECIES = {
+  // swimCost = energy/sec at cruise speed; cost grows with (speed / cruise)^3, so sprinting drains fast
+  bluegill: { name: 'Bluegill',        fov: 100, speed: 1.6, sprint: 3.5, radius: 0.08, swimCost: 0.5 },
+  bass:     { name: 'Largemouth Bass', fov: 80,  speed: 2.2, sprint: 3.5, radius: 0.15, swimCost: 0.8 }, // sprint ≈ 11.5 ft/s
+};
+let species = 'bluegill';
+
+// ---------------- Renderer / scene ----------------
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(innerWidth, innerHeight);
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+document.body.prepend(renderer.domElement);
+
+const scene = new THREE.Scene();
+const waterCol = new THREE.Color(CONFIG.waterColor);
+const deepCol = waterCol.clone().multiplyScalar(0.35);
+scene.fog = new THREE.FogExp2(waterCol.clone(), 0.1);
+// Exp2 fog is ~95% opaque at distance 1.73 / density, so solve density from visibility.
+function setVisibility(ft) {
+  CONFIG.visibilityFt = ft;
+  scene.fog.density = 1.73 / (ft * FT);
+}
+setVisibility(CONFIG.visibilityFt);
+
+// Clarity slider (expressed as underwater visibility in feet)
+const visSlider = document.getElementById('visSlider'), visLabel = document.getElementById('visLabel');
+visSlider.value = CONFIG.visibilityFt;
+visLabel.textContent = `~${CONFIG.visibilityFt} ft visibility`;
+visSlider.addEventListener('input', () => {
+  setVisibility(+visSlider.value);
+  visLabel.textContent = `~${visSlider.value} ft visibility`;
+});
+visSlider.addEventListener('change', () => visSlider.blur()); // give keys back to swimming
+scene.background = waterCol.clone();
+
+const camera = new THREE.PerspectiveCamera(SPECIES[species].fov, innerWidth / innerHeight, 0.02, 300);
+
+scene.add(new THREE.HemisphereLight(0xcfeeff, 0x1a2a18, 0.9));
+const sun = new THREE.DirectionalLight(0xffffff, 1.2);
+sun.position.set(20, 50, 10);
+scene.add(sun);
+
+// ---------------- Lake bottom ----------------
+function floorY(x, z) {
+  const r = Math.hypot(x, z) / R;
+  const bowl = -MAX_DEPTH * Math.max(0, 1 - r * r) + (r > 1 ? (r - 1) * 12 : 0);
+  const bumps = Math.sin(x * 0.15) * 0.4 + Math.cos(z * 0.12) * 0.4 + Math.sin((x + z) * 0.3) * 0.15;
+  return bowl + bumps + 0.5;
+}
+
+{
+  const size = R * 2.6, seg = 160;
+  const geo = new THREE.PlaneGeometry(size, size, seg, seg);
+  geo.rotateX(-Math.PI / 2);
+  const pos = geo.attributes.position;
+  const colors = [];
+  const sand = new THREE.Color(0x8a7a55), mud = new THREE.Color(0x3a3524), grass = new THREE.Color(0x4f6b2e);
+  for (let i = 0; i < pos.count; i++) {
+    const x = pos.getX(i), z = pos.getZ(i);
+    const y = floorY(x, z);
+    pos.setY(i, y);
+    const c = y > 0.3 ? grass : sand.clone().lerp(mud, THREE.MathUtils.clamp(-y / MAX_DEPTH, 0, 1));
+    const n = 0.9 + Math.random() * 0.2;
+    colors.push(c.r * n, c.g * n, c.b * n);
+  }
+  geo.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
+  geo.computeVertexNormals();
+  scene.add(new THREE.Mesh(geo, new THREE.MeshLambertMaterial({ vertexColors: true })));
+}
+
+// ---------------- Water surface (seen from below) ----------------
+const surface = new THREE.Mesh(
+  new THREE.PlaneGeometry(R * 3, R * 3),
+  new THREE.MeshBasicMaterial({ color: 0xa8dccc, transparent: true, opacity: 0.7, side: THREE.DoubleSide })
+);
+surface.rotation.x = Math.PI / 2;
+scene.add(surface);
+
+// ---------------- Helpers ----------------
+function randomLakeXZ(minDepth = 0.5, maxDepth = 99) {
+  for (let i = 0; i < 200; i++) {
+    const a = Math.random() * Math.PI * 2, r = Math.sqrt(Math.random()) * R * 0.95;
+    const x = Math.cos(a) * r, z = Math.sin(a) * r;
+    const d = -floorY(x, z);
+    if (d >= minDepth && d <= maxDepth) return [x, z];
+  }
+  return [0, 0];
+}
+
+// ---------------- Weeds (shallow littoral zone) ----------------
+const weedGeo = new THREE.ConeGeometry(0.05, 1, 4);
+weedGeo.translate(0, 0.5, 0);
+const weeds = new THREE.InstancedMesh(weedGeo, new THREE.MeshLambertMaterial({ color: 0x3f7a2a }), CONFIG.weedCount);
+const weedData = [];
+const m4 = new THREE.Matrix4(), q = new THREE.Quaternion(), s = new THREE.Vector3(), p = new THREE.Vector3(), e = new THREE.Euler();
+for (let i = 0; i < CONFIG.weedCount; i++) {
+  const [x, z] = randomLakeXZ(0.6, 3.5);
+  const depth = -floorY(x, z);
+  const h = THREE.MathUtils.randFloat(0.4, depth * 0.9);
+  weedData.push({ x, y: floorY(x, z), z, h, phase: Math.random() * 6.28 });
+}
+scene.add(weeds);
+function updateWeeds(t) {
+  for (let i = 0; i < weedData.length; i++) {
+    const w = weedData[i];
+    e.set(Math.sin(t * 0.8 + w.phase) * 0.12, 0, Math.cos(t * 0.6 + w.phase) * 0.12);
+    q.setFromEuler(e);
+    m4.compose(p.set(w.x, w.y, w.z), q, s.set(1, w.h, 1));
+    weeds.setMatrixAt(i, m4);
+  }
+  weeds.instanceMatrix.needsUpdate = true;
+}
+
+// ---------------- Rocks ----------------
+{
+  const rocks = new THREE.InstancedMesh(new THREE.DodecahedronGeometry(1, 0),
+    new THREE.MeshLambertMaterial({ color: 0x5c5c55 }), CONFIG.rockCount);
+  for (let i = 0; i < CONFIG.rockCount; i++) {
+    const [x, z] = randomLakeXZ(0.3, 99);
+    const sc = THREE.MathUtils.randFloat(0.2, 1.2);
+    e.set(Math.random() * 3, Math.random() * 3, Math.random() * 3);
+    m4.compose(p.set(x, floorY(x, z), z), q.setFromEuler(e), s.set(sc, sc * 0.7, sc));
+    rocks.setMatrixAt(i, m4);
+  }
+  scene.add(rocks);
+}
+
+// ---------------- Scale reference cubes ----------------
+const REF_CUBE_FT = 5;
+const REF_CUBE_SPOTS = [ // [x, z] as fractions of lake radius
+  [0.4 - 7 / R, 0],  // just ahead of where you start
+  [0, 0],            // deepest point
+  [0, -0.6],         // north
+  [-0.5, 0.35],      // southwest
+];
+const refCubes = [];
+{
+  const size = REF_CUBE_FT * FT;
+  const geo = new THREE.BoxGeometry(size, size, size);
+  const mat = new THREE.MeshLambertMaterial({ color: 0xff8c1a, transparent: true, opacity: 0.8 });
+  const edges = new THREE.EdgesGeometry(geo);
+  const edgeMat = new THREE.LineBasicMaterial({ color: 0xffffff });
+
+  // Text label as a sprite that always faces you
+  const c = document.createElement('canvas');
+  c.width = 256; c.height = 64;
+  const g = c.getContext('2d');
+  g.fillStyle = 'rgba(0,0,0,.55)'; g.fillRect(0, 0, 256, 64);
+  g.fillStyle = '#fff'; g.font = 'bold 34px system-ui'; g.textAlign = 'center'; g.textBaseline = 'middle';
+  g.fillText(`${REF_CUBE_FT} × ${REF_CUBE_FT} × ${REF_CUBE_FT} ft`, 128, 32);
+  const labelMat = new THREE.SpriteMaterial({ map: new THREE.CanvasTexture(c) });
+
+  for (const [fx, fz] of REF_CUBE_SPOTS) {
+    const x = fx * R, z = fz * R;
+    const cube = new THREE.Group();
+    cube.add(new THREE.Mesh(geo, mat), new THREE.LineSegments(edges, edgeMat));
+    const label = new THREE.Sprite(labelMat);
+    label.scale.set(size * 0.8, size * 0.2, 1);
+    label.position.y = size * 0.75;
+    cube.add(label);
+    cube.position.set(x, floorY(x, z) + size / 2 - 0.1, z);
+    scene.add(cube);
+    refCubes.push(cube);
+  }
+}
+
+// ---------------- Floating particles (sells the "underwater" look) ----------------
+{
+  const n = 6000, arr = new Float32Array(n * 3);
+  for (let i = 0; i < n; i++) {
+    const [x, z] = randomLakeXZ(0.3, 99);
+    arr[i * 3] = x; arr[i * 3 + 2] = z;
+    arr[i * 3 + 1] = THREE.MathUtils.randFloat(floorY(x, z), 0);
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.BufferAttribute(arr, 3));
+  scene.add(new THREE.Points(g, new THREE.PointsMaterial({ color: 0xd8e8d0, size: 0.03, transparent: true, opacity: 0.6 })));
+}
+
+// ---------------- NPC fish ----------------
+function makeFish(type) {
+  const g = new THREE.Group();
+  const isBass = type === 'bass';
+  const len = isBass ? 0.4 : 0.18;
+  const bodyMat = new THREE.MeshLambertMaterial({ color: isBass ? 0x5d6e36 : 0x4f6a6a });
+  const body = new THREE.Mesh(new THREE.SphereGeometry(1, 12, 8), bodyMat);
+  body.scale.set(isBass ? 0.06 : 0.025, isBass ? 0.07 : 0.075, len / 2);
+  g.add(body);
+  const tail = new THREE.Mesh(new THREE.ConeGeometry(isBass ? 0.06 : 0.05, len * 0.35, 4), bodyMat);
+  tail.rotation.x = -Math.PI / 2;
+  tail.scale.z = 0.3;
+  tail.position.z = -len / 2 - len * 0.1;
+  g.add(tail);
+  if (!isBass) { // orange-ish breast on bluegill
+    const belly = new THREE.Mesh(new THREE.SphereGeometry(1, 8, 6), new THREE.MeshLambertMaterial({ color: 0xc9792a }));
+    belly.scale.set(0.022, 0.035, 0.05); belly.position.set(0, -0.035, 0.02);
+    g.add(belly);
+  }
+  g.userData.tail = tail;
+  return g;
+}
+
+const fish = [];
+function spawn(type, count) {
+  for (let i = 0; i < count; i++) {
+    const mesh = makeFish(type);
+    const [x, z] = type === 'bluegill' ? randomLakeXZ(0.8, 4) : randomLakeXZ(1.5, 99);
+    mesh.position.set(x, THREE.MathUtils.lerp(floorY(x, z), 0, 0.5), z);
+    scene.add(mesh);
+    fish.push({ type, mesh, vel: new THREE.Vector3(), target: new THREE.Vector3(), t: 0,
+                speed: type === 'bass' ? 0.6 : 0.4 });
+  }
+}
+spawn('bluegill', CONFIG.bluegillCount);
+spawn('bass', CONFIG.bassCount);
+
+function pickTarget(f) {
+  const [x, z] = f.type === 'bluegill' ? randomLakeXZ(0.8, 4) : randomLakeXZ(1.5, 99);
+  const fy = floorY(x, z);
+  f.target.set(x, THREE.MathUtils.randFloat(fy + 0.3, -0.3), z);
+}
+fish.forEach(pickTarget);
+
+const tmp = new THREE.Vector3();
+function updateFish(dt, t) {
+  for (const f of fish) {
+    const pos = f.mesh.position;
+    let speed = f.speed;
+    // Bluegill flee if the player is a bass and close by
+    const toPlayer = tmp.copy(camera.position).sub(pos);
+    if (species === 'bass' && f.type === 'bluegill' && toPlayer.length() < 3) {
+      f.target.copy(pos).sub(toPlayer.setLength(4));
+      speed = 2.5;
+    } else if (pos.distanceTo(f.target) < 0.5) {
+      pickTarget(f);
+    }
+    const desired = tmp.copy(f.target).sub(pos).setLength(speed);
+    f.vel.lerp(desired, Math.min(1, dt * 1.5));
+    pos.addScaledVector(f.vel, dt);
+    pos.y = THREE.MathUtils.clamp(pos.y, floorY(pos.x, pos.z) + 0.15, -0.15);
+    if (f.vel.lengthSq() > 1e-4) f.mesh.lookAt(tmp.copy(pos).add(f.vel));
+    f.t += dt * (2 + f.vel.length() * 8);
+    f.mesh.userData.tail.rotation.y = Math.sin(f.t) * 0.4;
+  }
+}
+
+// ---------------- Energy (shared rules for you and the smart bluegill) ----------------
+const ENERGY = {
+  max: 100,
+  restPerSec: 0.15,     // base metabolism, even sitting still
+  playerStart: 70,
+  exhaustedAt: 5,       // below this you can't sprint; at 0 you're limited to half cruise speed
+  ozToEnergy: 4,        // bass: energy gained per ounce of bluegill eaten
+  forageGain: 3,        // bluegill: energy per second picking at weeds
+};
+const player = { energy: ENERGY.playerStart, foraging: false, canForage: false };
+
+// ---------------- Smart bluegill: real-ish predator response ----------------
+// Behavior loop:  FORAGE (pick around its weed bed) → ALERT (spots a bass: freeze, face it, ease back)
+//                 → FLEE (burst to the nearest cover away from the threat, dodge if it's close)
+//                 → HIDE (hold tight in the weeds until things calm down) → FORAGE
+// Threats are the NPC bass, and you when you're playing as a bass.
+const BG = {
+  minLengthIn: 4, maxLengthIn: 9,  // size range for new fish
+  visionFt: 25,         // max sight distance in perfectly clear water (also capped by water clarity)
+  lateralLineFt: 3,     // feels an approaching fish this close, even unseen (lateral line)
+  blindSpotDeg: 30,     // can't see straight behind
+  forageBL: 1,          // speeds in body lengths per second, so bigger fish are faster
+  burstBL: 12,          // fast-start escape burst...
+  burstSec: 0.8,        // ...lasts this long
+  fleeBL: 6,            // then sustained flee speed
+  alertAt: 0.3,         // threat level (0-1) that triggers ALERT
+  fleeAt: 0.7,          // threat level that triggers FLEE
+  calmSec: 5,           // how long it stays hidden after the threat is gone
+  catchFt: 1.1,         // bass mouth this close = caught (0.6 ft if it's tucked in the weeds)
+  swimCost: 0.05,       // energy/sec per (body lengths/sec)^2 — bursting is expensive
+  forageGain: 1.5,      // energy/sec while picking at food
+};
+const BG_COLORS = { forage: '#7dff9a', alert: '#ffe14d', flee: '#ff5a4d', hide: '#7ab8ff' };
+const BG_NAMES = { forage: 'FORAGING', alert: 'ALERT', flee: 'FLEEING', hide: 'HIDING' };
+const MODEL_BLUEGILL_IN = 7.1;   // length of the bluegill mesh at scale 1
+let labelsOn = true, caughtCount = 0;
+
+const coverPos = w => new THREE.Vector3(w.x, w.y + Math.min(w.h * 0.5, 0.6), w.z);
+const _to = new THREE.Vector3(), _fwd = new THREE.Vector3(), UP = new THREE.Vector3(0, 1, 0);
+
+class SmartBluegill {
+  constructor() {
+    this.mesh = makeFish('bluegill');
+    scene.add(this.mesh);
+    this.vel = new THREE.Vector3();
+    this.face = new THREE.Vector3(0, 0, 1);
+    this.home = new THREE.Vector3();
+    this.target = new THREE.Vector3();
+    this.cover = new THREE.Vector3();
+    this.threat = { level: 0, dist: Infinity, dir: new THREE.Vector3(1, 0, 0), closing: 0 };
+    this.state = 'forage'; this.timer = 0; this.calm = 0; this.pause = 0; this.dodgeSign = 1;
+
+    // Floating label (debug view, toggle with B)
+    this.labelCanvas = document.createElement('canvas');
+    this.labelCanvas.width = 256; this.labelCanvas.height = 96;
+    this.labelTex = new THREE.CanvasTexture(this.labelCanvas);
+    this.label = new THREE.Sprite(new THREE.SpriteMaterial({ map: this.labelTex, fog: false, depthTest: false }));
+    this.label.scale.set(0.6, 0.225, 1);
+    scene.add(this.label);
+    this.labelTimer = 0;
+
+    this.rollSize();
+  }
+
+  // New random fish: length, then weight from the bluegill standard-weight equation
+  // (log10 W[g] = -5.374 + 3.316 · log10 TL[mm]) times a body-condition factor.
+  rollSize() {
+    this.lengthIn = THREE.MathUtils.randFloat(BG.minLengthIn, BG.maxLengthIn);
+    const standardG = 10 ** (-5.374 + 3.316 * Math.log10(this.lengthIn * 25.4));
+    this.condition = THREE.MathUtils.randFloat(0.85, 1.15);   // skinny ↔ plump
+    this.weightOz = standardG * this.condition / 28.35;
+    this.energy = THREE.MathUtils.randFloat(40, 90);
+    this.mesh.scale.setScalar(this.lengthIn / MODEL_BLUEGILL_IN);
+  }
+
+  get bodyLengthM() { return this.lengthIn * 0.0254; }
+  get hunger() { return 1 - this.energy / ENERGY.max; }       // 0 = full, 1 = starving
+  speed(bl) { return bl * this.bodyLengthM * (0.6 + 0.4 * this.energy / ENERGY.max); } // tired = slower
+
+  placeAt(w) {
+    this.home.copy(coverPos(w));
+    this.mesh.position.copy(this.home);
+    this.vel.set(0, 0, 0);
+    this.pickForageTarget();
+    this.setState('forage');
+  }
+
+  pickForageTarget() {
+    const h = this.home;
+    const x = h.x + THREE.MathUtils.randFloatSpread(2.4), z = h.z + THREE.MathUtils.randFloatSpread(2.4);
+    const y = THREE.MathUtils.clamp(h.y + THREE.MathUtils.randFloatSpread(0.8), floorY(x, z) + 0.15, -0.2);
+    this.target.set(x, y, z);
+  }
+
+  // Best weed to run to: close to me, far from the threat, optionally not where I already am
+  findCover(threatPos, excludeHere) {
+    const pos = this.mesh.position;
+    let best = null, bestScore = Infinity;
+    for (const w of weedData) {
+      const c = coverPos(w);
+      const dMe = c.distanceTo(pos);
+      if (dMe > 20 || (excludeHere && dMe < 1.5)) continue;
+      const score = dMe - 0.8 * c.distanceTo(threatPos);
+      if (score < bestScore) { bestScore = score; best = c; }
+    }
+    return best ?? pos.clone().addScaledVector(this.threat.dir, -8); // no weeds nearby: run straight away
+  }
+
+  setState(s) {
+    this.state = s; this.timer = 0; this.calm = 0;
+    if (s === 'flee') {
+      const tp = this.mesh.position.clone().addScaledVector(this.threat.dir, this.threat.dist);
+      this.cover.copy(this.findCover(tp, true));
+      this.dodgeSign = Math.random() < 0.5 ? -1 : 1;
+    }
+    this.drawLabel();
+  }
+
+  // How scary is one predator right now? 0 = not noticed, 1 = imminent
+  assessThreat(tPos, tVel, tFwd) {
+    _to.copy(tPos).sub(this.mesh.position);
+    const dist = _to.length() || 0.001;
+    _to.divideScalar(dist);
+    const range = Math.min(BG.visionFt, CONFIG.visibilityFt) * FT;
+    const inView = this.face.angleTo(_to) < Math.PI - THREE.MathUtils.degToRad(BG.blindSpotDeg / 2);
+    const closing = -tVel.dot(_to);                 // m/s the predator is coming at me
+    const facing = Math.max(0, -tFwd.dot(_to));     // 1 = it's pointed right at me
+    let level = 0;
+    if (inView && dist < range) level = (1 - dist / range) * (0.6 + 0.4 * facing) + Math.max(0, closing) * 0.25;
+    if (dist < BG.lateralLineFt * FT && closing > 0.2) level = Math.max(level, 0.9);
+    return { level: Math.min(level, 1), dist, dir: _to.clone(), closing };
+  }
+
+  worstThreat() {
+    let worst = { level: 0, dist: Infinity, dir: new THREE.Vector3(1, 0, 0), closing: 0 };
+    const consider = (p, v, f) => {
+      const a = this.assessThreat(p, v, f);
+      if (a.level > worst.level || (worst.level === 0 && a.dist < worst.dist)) worst = a;
+    };
+    for (const f of fish) if (f.type === 'bass') consider(f.mesh.position, f.vel, _fwd.copy(f.vel).normalize());
+    if (species === 'bass') consider(camera.position, vel, camera.getWorldDirection(_fwd));
+    return worst;
+  }
+
+  update(dt, t) {
+    const pos = this.mesh.position, th = this.worstThreat();
+    this.threat = th;
+    this.timer += dt;
+    // Hungry fish take more risks: they tolerate a closer threat and come out of hiding sooner
+    const alertAt = BG.alertAt + 0.15 * this.hunger, fleeAt = BG.fleeAt + 0.15 * this.hunger;
+    const desired = new THREE.Vector3();
+    let look = null, accel = 2, turn = 3, picking = false;
+
+    switch (this.state) {
+      case 'forage': {
+        if (th.level > fleeAt) { this.setState('flee'); break; }
+        if (th.level > alertAt) { this.setState('alert'); break; }
+        if (this.pause > 0) { this.pause -= dt; picking = true; break; }   // hovering, picking at food
+        if (pos.distanceTo(this.target) < 0.15) {
+          this.pause = THREE.MathUtils.randFloat(1, 3) * (1 + this.hunger); // hungry = feeds longer
+          this.pickForageTarget(); break;
+        }
+        desired.copy(this.target).sub(pos).setLength(this.speed(BG.forageBL));
+        break;
+      }
+      case 'alert': {
+        look = th.dir;                                     // face the threat
+        desired.copy(th.dir).multiplyScalar(-0.1);         // ease backward
+        if (th.level > fleeAt || (th.closing > 1 && th.dist < 3)) { this.setState('flee'); break; }
+        if (th.level < 0.15) { this.calm += dt; if (this.calm > 2) this.setState('forage'); } else this.calm = 0;
+        break;
+      }
+      case 'flee': {
+        accel = 10; turn = 14;
+        const sp = this.speed(this.timer < BG.burstSec ? BG.burstBL : BG.fleeBL);
+        const dir = this.cover.clone().sub(pos).normalize();
+        if (th.dist < 1.2 && th.closing > 0.5) {           // predator on top of it: juke sideways
+          const side = new THREE.Vector3().crossVectors(th.dir, UP).normalize();
+          dir.copy(side.multiplyScalar(this.dodgeSign)).addScaledVector(th.dir, -0.7).normalize();
+        }
+        desired.copy(dir).multiplyScalar(sp);
+        if (pos.distanceTo(this.cover) < 0.4) this.setState('hide');
+        break;
+      }
+      case 'hide': {
+        if (th.level > 0.1) look = th.dir;
+        desired.copy(this.cover).sub(pos).multiplyScalar(1.5); // hold position in the weeds
+        if (th.level > 0.85 && th.dist < 1.5) { this.setState('flee'); break; }
+        if (th.level < 0.2) {
+          this.calm += dt;
+          if (this.calm > BG.calmSec * (1 - 0.6 * this.hunger)) {
+            this.home.copy(this.cover); this.pickForageTarget(); this.setState('forage');
+          }
+        } else this.calm = 0;
+        break;
+      }
+    }
+
+    this.vel.lerp(desired, Math.min(1, dt * accel));
+    pos.addScaledVector(this.vel, dt);
+    pos.y = THREE.MathUtils.clamp(pos.y, floorY(pos.x, pos.z) + 0.12, -0.15);
+
+    // Energy: base metabolism + swimming cost (grows with the square of speed in body lengths/sec)
+    const bl = this.vel.length() / this.bodyLengthM;
+    this.energy -= (ENERGY.restPerSec + BG.swimCost * bl * bl) * dt;
+    if (picking) this.energy += BG.forageGain * dt;
+    this.energy = THREE.MathUtils.clamp(this.energy, 0, ENERGY.max);
+
+    const want = look ?? (this.vel.lengthSq() > 1e-3 ? this.vel.clone().normalize() : this.face);
+    this.face.lerp(want, Math.min(1, dt * turn)).normalize();
+    this.mesh.lookAt(pos.clone().add(this.face));
+    if (picking) this.mesh.rotateX(0.35);               // nose down, picking
+    const fleeing = this.state === 'flee';
+    this.mesh.userData.tail.rotation.y = Math.sin(t * (fleeing ? 30 : 6)) * (fleeing ? 0.6 : 0.25);
+
+    this.label.visible = labelsOn;
+    this.label.position.copy(pos).y += 0.3 * this.lengthIn / MODEL_BLUEGILL_IN + 0.1;
+    if ((this.labelTimer -= dt) <= 0) this.drawLabel();
+
+    // Did you (as a bass) catch it?
+    if (species === 'bass') {
+      const reach = (this.state === 'hide' ? 0.6 : BG.catchFt) * FT;
+      if (camera.position.distanceTo(pos) < reach) this.getEaten();
+    }
+  }
+
+  getEaten() {
+    const gain = this.weightOz * ENERGY.ozToEnergy;
+    player.energy = Math.min(ENERGY.max, player.energy + gain);
+    caughtCount++;
+    showMsg(`Ate a ${this.lengthIn.toFixed(1)} in, ${this.weightOz.toFixed(1)} oz bluegill  (+${gain.toFixed(0)} energy)`);
+    // A new fish shows up somewhere far away
+    const far = weedData.filter(w => Math.hypot(w.x - camera.position.x, w.z - camera.position.z) > 15);
+    this.rollSize();
+    this.placeAt(far[Math.floor(Math.random() * far.length)] ?? weedData[0]);
+  }
+
+  drawLabel() {
+    this.labelTimer = 0.5;
+    const g = this.labelCanvas.getContext('2d');
+    g.clearRect(0, 0, 256, 96);
+    g.fillStyle = 'rgba(0,0,0,.6)'; g.fillRect(0, 0, 256, 96);
+    g.textAlign = 'center'; g.textBaseline = 'middle';
+    g.fillStyle = BG_COLORS[this.state]; g.font = 'bold 30px system-ui';
+    g.fillText(BG_NAMES[this.state], 128, 28);
+    g.fillStyle = '#fff'; g.font = '22px system-ui';
+    g.fillText(`${this.lengthIn.toFixed(1)} in · ${this.weightOz.toFixed(1)} oz · E ${this.energy.toFixed(0)}`, 128, 68);
+    this.labelTex.needsUpdate = true;
+  }
+}
+
+const msgEl = document.getElementById('msg');
+let msgTimer = 0;
+function showMsg(text) { msgEl.textContent = text; msgEl.style.opacity = 1; msgTimer = 2.5; }
+function updateMsg(dt) { if (msgTimer > 0 && (msgTimer -= dt) <= 0) msgEl.style.opacity = 0; }
+
+// Spawn: the first one in the weed bed nearest your start, the rest spread around the lake
+const smartBluegill = [];
+{
+  const sx = R * 0.4, sz = 0;
+  let nearest = weedData[0], bd = Infinity;
+  for (const w of weedData) { const d = Math.hypot(w.x - sx, w.z - sz); if (d < bd) { bd = d; nearest = w; } }
+  const spots = [nearest];
+  for (let tries = 0; spots.length < CONFIG.smartBluegillCount && tries < 2000; tries++) {
+    const w = weedData[Math.floor(Math.random() * weedData.length)];
+    if (spots.every(o => Math.hypot(o.x - w.x, o.z - w.z) > 10)) spots.push(w);
+  }
+  for (const w of spots) { const b = new SmartBluegill(); b.placeAt(w); smartBluegill.push(b); }
+}
+function nearestSmartBluegill() {
+  let best = null, bd = Infinity;
+  for (const b of smartBluegill) { const d = b.mesh.position.distanceTo(camera.position); if (d < bd) { bd = d; best = b; } }
+  return best;
+}
+function nearWeed(p) {
+  for (const w of weedData) if (Math.hypot(w.x - p.x, w.z - p.z) < 0.7 && p.y < w.y + w.h + 0.2) return true;
+  return false;
+}
+
+// ---------------- Lateral line: feel nearby fish as red silhouettes ----------------
+// The lateral line senses the water a fish pushes around. Signal grows with the fish's size and
+// speed and fades fast with distance; your own swimming drowns it out (self-noise).
+// It ignores murk and weeds, so the silhouettes draw through everything.
+// Strong signal = crisp, solid silhouette.  Weak signal = faint, smeared, wobbling.
+const LL = {
+  gain: 2,            // overall sensitivity
+  threshold: 0.04,    // signals below this aren't felt at all
+  maxRangeFt: 40,     // skip anything farther than this
+  stillPush: 0.05,    // even a hovering fish fans its fins a little
+  selfNoise: 0.6,     // how much your own speed dulls the sense (sprinting ≈ half as sensitive)
+  copies: 7,          // overlapping copies used to draw the blur
+};
+let llOn = true;
+const llDirs = [[0, 0, 0], [1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0.6, 0.5, 0.6], [-0.6, -0.5, -0.6]]
+  .map(d => new THREE.Vector3(...d).normalize());
+const llSources = [], llSensed = [];
+const llState = { dull: 1 };
+
+function addLLSource(type, mesh, vel, lenFn) {
+  const mat = new THREE.MeshBasicMaterial({ color: 0xff2a2a, transparent: true, opacity: 0,
+    depthTest: false, depthWrite: false, fog: false });
+  const ghost = new THREE.Group();
+  ghost.visible = false;
+  const copies = [];
+  for (let i = 0; i < LL.copies; i++) {
+    const c = makeFish(type);
+    c.traverse(o => { if (o.isMesh) { o.material = mat; o.renderOrder = 10; } });
+    ghost.add(c); copies.push(c);
+  }
+  scene.add(ghost);
+  llSources.push({ mesh, vel, lenFn, modelLen: type === 'bass' ? 0.4 : 0.18, ghost, copies, mat, s: 0 });
+}
+for (const f of fish) { const L = f.type === 'bass' ? 0.4 : 0.18; addLLSource(f.type, f.mesh, f.vel, () => L); }
+for (const b of smartBluegill) addLLSource('bluegill', b.mesh, b.vel, () => b.bodyLengthM);
+
+function updateLateralLine(dt, t) {
+  llSensed.length = 0;
+  camera.updateMatrixWorld();
+  llState.dull = 1 / (1 + LL.selfNoise * (vel.length() / SPECIES[species].speed) ** 2);
+  for (const src of llSources) {
+    const pos = src.mesh.position;
+    const r = Math.max(pos.distanceTo(camera.position), 0.1);
+    let target = 0;
+    if (llOn && r < LL.maxRangeFt * FT) {
+      const push = src.lenFn() * (LL.stillPush + src.vel.length());   // size × speed
+      const sig = LL.gain * llState.dull * push / (r * r);
+      target = sig < LL.threshold ? 0 : Math.min(1, sig);
+    }
+    // Quick to notice, slower to fade
+    src.s += (target - src.s) * Math.min(1, dt * (target > src.s ? 8 : 2.5));
+    const s = src.s;
+    if (s < 0.01) { src.ghost.visible = false; continue; }
+
+    src.ghost.visible = true;
+    src.ghost.position.copy(pos);
+    src.ghost.quaternion.copy(src.mesh.quaternion);
+    src.ghost.scale.copy(src.mesh.scale);
+    // If you can plainly see the fish, tone the red down so it doesn't cover it
+    const seen = Math.exp(-((scene.fog.density * r) ** 2));
+    const total = Math.pow(s, 0.6) * (1 - 0.45 * seen) * 0.9;
+    src.mat.opacity = 1 - Math.pow(1 - total, 1 / LL.copies); // all copies stacked ≈ total
+    const blur = (1 - s) ** 2;
+    const tail = src.mesh.userData.tail.rotation.y;
+    src.copies.forEach((c, i) => {
+      const wob = 0.6 + 0.4 * Math.sin(t * (2 + i) + i * 1.7);
+      c.position.copy(llDirs[i]).multiplyScalar(blur * src.modelLen * 0.9 * wob);
+      c.scale.setScalar(1 + blur * 0.5);
+      c.userData.tail.rotation.y = tail;
+    });
+    if (target > 0) llSensed.push({ pos, s });
+  }
+  drawLLEdges();
+}
+
+// Things you feel but can't see (behind you, off to the side) glow at the screen edge
+const llEdge = document.getElementById('llEdge'), llCtx = llEdge.getContext('2d');
+function sizeLLEdge() { llEdge.width = innerWidth; llEdge.height = innerHeight; }
+sizeLLEdge();
+const _llCam = new THREE.Vector3(), _llNdc = new THREE.Vector3();
+function drawLLEdges() {
+  const W = llEdge.width, H = llEdge.height;
+  llCtx.clearRect(0, 0, W, H);
+  for (const x of llSensed) {
+    _llCam.copy(x.pos).applyMatrix4(camera.matrixWorldInverse);
+    _llNdc.copy(x.pos).project(camera);
+    if (_llCam.z < 0 && Math.abs(_llNdc.x) < 0.95 && Math.abs(_llNdc.y) < 0.95) continue; // on screen
+    let dx = _llCam.x, dy = _llCam.y;
+    if (_llCam.z > 0) dy -= _llCam.z * 0.5;              // behind you → toward the bottom edge
+    const a = Math.atan2(-dy, dx), ca = Math.cos(a), sa = Math.sin(a);
+    const k = Math.min(W / 2 / Math.max(Math.abs(ca), 1e-3), H / 2 / Math.max(Math.abs(sa), 1e-3));
+    const px = W / 2 + ca * k, py = H / 2 + sa * k;
+    const rad = 50 + 130 * (1 - x.s);                     // weak = big and soft, strong = tight
+    const g = llCtx.createRadialGradient(px, py, 0, px, py, rad);
+    g.addColorStop(0, `rgba(255,40,40,${(Math.pow(x.s, 0.6) * 0.75).toFixed(3)})`);
+    g.addColorStop(1, 'rgba(255,40,40,0)');
+    llCtx.fillStyle = g;
+    llCtx.fillRect(px - rad, py - rad, rad * 2, rad * 2);
+  }
+}
+
+// ---------------- Player controls ----------------
+camera.position.set(R * 0.4, -1.5, 0);
+let yaw = Math.PI / 2, pitch = 0;
+const keys = {};
+const vel = new THREE.Vector3();
+
+addEventListener('keydown', ev => {
+  keys[ev.code] = true;
+  if (ev.code === 'Digit1') setSpecies('bluegill');
+  if (ev.code === 'Digit2') setSpecies('bass');
+  if (ev.code === 'KeyB') labelsOn = !labelsOn;
+  if (ev.code === 'KeyL') llOn = !llOn;
+  if (ev.code === 'KeyM') mapEl.style.display = mapEl.style.display === 'none' ? '' : 'none';
+});
+addEventListener('keyup', ev => { keys[ev.code] = false; });
+
+const startEl = document.getElementById('start');
+startEl.addEventListener('click', () => {
+  startEl.style.display = 'none';
+  renderer.domElement.requestPointerLock?.()?.catch?.(() => {});
+});
+renderer.domElement.addEventListener('click', () => renderer.domElement.requestPointerLock?.()?.catch?.(() => {}));
+let dragging = false;
+renderer.domElement.addEventListener('mousedown', () => dragging = true);
+addEventListener('mouseup', () => dragging = false);
+addEventListener('mousemove', ev => {
+  if (document.pointerLockElement !== renderer.domElement && !dragging) return;
+  yaw -= ev.movementX * 0.0025;
+  pitch = THREE.MathUtils.clamp(pitch - ev.movementY * 0.0025, -1.4, 1.4);
+});
+
+function setSpecies(name) {
+  species = name;
+  camera.fov = SPECIES[name].fov;
+  camera.updateProjectionMatrix();
+}
+
+const fwd = new THREE.Vector3(), right = new THREE.Vector3(), up = new THREE.Vector3(0, 1, 0);
+function updatePlayer(dt) {
+  const sp = SPECIES[species];
+  camera.rotation.set(pitch, yaw, 0, 'YXZ');
+  camera.getWorldDirection(fwd);
+  right.crossVectors(fwd, up).normalize();
+
+  const want = new THREE.Vector3();
+  if (keys.KeyW) want.add(fwd);
+  if (keys.KeyS) want.sub(fwd);
+  if (keys.KeyD) want.add(right);
+  if (keys.KeyA) want.sub(right);
+  if (keys.Space) want.y += 1;
+  if (keys.KeyC) want.y -= 1;
+  const sprinting = (keys.ShiftLeft || keys.ShiftRight) && player.energy > ENERGY.exhaustedAt;
+  let max = sprinting ? sp.sprint : sp.speed;
+  if (player.energy <= 0) max = sp.speed * 0.5;          // exhausted: can only limp along
+  if (want.lengthSq() > 0) want.setLength(max);
+
+  vel.lerp(want, Math.min(1, dt * 3)); // water drag / inertia
+  camera.position.addScaledVector(vel, dt);
+
+  // Energy: base metabolism + swimming cost, which climbs steeply with speed
+  const v = vel.length();
+  player.energy -= (ENERGY.restPerSec + sp.swimCost * (v / sp.speed) ** 3) * dt;
+  // Bluegill can hold F next to weeds to pick at bugs and regain energy
+  player.canForage = species === 'bluegill' && nearWeed(camera.position);
+  player.foraging = player.canForage && keys.KeyF && v < 0.3;
+  if (player.foraging) player.energy += ENERGY.forageGain * dt;
+  player.energy = THREE.MathUtils.clamp(player.energy, 0, ENERGY.max);
+
+  const c = camera.position;
+  const rr = Math.hypot(c.x, c.z);
+  if (rr > R * 1.05) { c.x *= R * 1.05 / rr; c.z *= R * 1.05 / rr; }
+  c.y = THREE.MathUtils.clamp(c.y, floorY(c.x, c.z) + sp.radius + 0.05, -sp.radius - 0.05);
+}
+
+// Water gets darker the deeper you go
+function updateWaterColor() {
+  const k = THREE.MathUtils.clamp(-camera.position.y / MAX_DEPTH, 0, 1);
+  scene.fog.color.copy(waterCol).lerp(deepCol, k);
+  scene.background.copy(scene.fog.color);
+}
+
+// ---------------- HUD ----------------
+const hud = document.getElementById('hud');
+function updateHud() {
+  hud.innerHTML =
+    `<b>${SPECIES[species].name}</b><br>` +
+    `Depth: ${(-camera.position.y / FT).toFixed(1)} ft &nbsp; Speed: ${(vel.length() / FT).toFixed(1)} ft/s<br>` +
+    energyLine() +
+    nearestLine() +
+    llLine() +
+    `<span style="opacity:.75">WASD swim · mouse look · Space/C up/down · Shift sprint · F forage (bluegill, by weeds)<br>` +
+    `1 = Bluegill · 2 = Bass · M = map · B = bluegill labels · L = lateral line · Esc releases mouse</span>`;
+}
+function energyLine() {
+  const e = player.energy;
+  const col = e > 50 ? '#6fdc6f' : e > 20 ? '#f0c040' : '#f05040';
+  const note = e <= 0 ? ' exhausted!' : e <= ENERGY.exhaustedAt ? ' too tired to sprint'
+    : player.foraging ? ' foraging…' : player.canForage ? ' (hold F to forage)' : '';
+  return `Energy <span style="display:inline-block;width:120px;height:8px;background:#333;border-radius:4px;vertical-align:middle">` +
+    `<span style="display:block;width:${e}%;height:100%;background:${col};border-radius:4px"></span></span> ` +
+    `${e.toFixed(0)}<span style="opacity:.8">${note}</span><br>`;
+}
+function llLine() {
+  if (!llOn) return `Lateral line: <b>off</b> (L)<br>`;
+  const n = llSensed.length;
+  const dull = llState.dull < 0.75 ? ` · <span style="color:#f0c040">dulled by your own swimming</span>` : '';
+  return `Lateral line: <b style="color:#ff5a5a">${n ? `feeling ${n} fish` : 'quiet'}</b>${dull}<br>`;
+}
+function nearestLine() {
+  const b = nearestSmartBluegill();
+  return `Nearest bluegill: <b style="color:${BG_COLORS[b.state]}">${BG_NAMES[b.state]}</b> · ` +
+    `${b.lengthIn.toFixed(1)} in, ${b.weightOz.toFixed(1)} oz · ` +
+    `${(b.mesh.position.distanceTo(camera.position) / FT).toFixed(0)} ft away · eaten ${caughtCount}<br>`;
+}
+
+// ---------------- Minimap (depth contours) ----------------
+// Top-down: +x to the right, -z (north) up. Contour line every CONTOUR_STEP_FT feet.
+const CONTOUR_STEP_FT = 2;
+const mapEl = document.getElementById('minimap');
+const mapCtx = mapEl.getContext('2d');
+const MAP = mapEl.width, MAP_EXTENT = R * 1.15; // world meters from center to map edge
+const worldToMap = (x, z) => [(x / MAP_EXTENT * 0.5 + 0.5) * MAP, (z / MAP_EXTENT * 0.5 + 0.5) * MAP];
+
+const mapBase = document.createElement('canvas');
+mapBase.width = mapBase.height = MAP;
+{
+  const ctx = mapBase.getContext('2d');
+  const img = ctx.createImageData(MAP, MAP);
+  const band = new Int16Array(MAP * MAP);
+  for (let py = 0; py < MAP; py++) for (let px = 0; px < MAP; px++) {
+    const x = (px / MAP - 0.5) * 2 * MAP_EXTENT, z = (py / MAP - 0.5) * 2 * MAP_EXTENT;
+    const d = -floorY(x, z);
+    band[py * MAP + px] = d <= 0 ? -1 : Math.floor(d / FT / CONTOUR_STEP_FT);
+  }
+  const shallow = new THREE.Color(0x8fd0d8), deep = new THREE.Color(0x0b2a52), land = new THREE.Color(0x5a6e3a);
+  const c = new THREE.Color();
+  for (let py = 0; py < MAP; py++) for (let px = 0; px < MAP; px++) {
+    const i = py * MAP + px, b = band[i];
+    if (b < 0) c.copy(land);
+    else c.copy(shallow).lerp(deep, Math.min(1, (b + 0.5) * CONTOUR_STEP_FT / CONFIG.maxDepthFt));
+    const edge = (px < MAP - 1 && band[i + 1] !== b) || (py < MAP - 1 && band[i + MAP] !== b);
+    if (edge) c.lerp(b < 0 || band[i + 1] < 0 || band[i + MAP] < 0 ? new THREE.Color(0xe8dcb0) : new THREE.Color(0xffffff), 0.6);
+    img.data.set([c.r * 255, c.g * 255, c.b * 255, 230], i * 4);
+  }
+  ctx.putImageData(img, 0, 0);
+  // Reference cubes as small white squares
+  ctx.fillStyle = '#fff'; ctx.strokeStyle = '#000';
+  for (const cube of refCubes) {
+    const [cx, cy] = worldToMap(cube.position.x, cube.position.z);
+    ctx.fillRect(cx - 3, cy - 3, 6, 6); ctx.strokeRect(cx - 3, cy - 3, 6, 6);
+  }
+  ctx.fillStyle = '#fff'; ctx.font = '11px system-ui';
+  ctx.fillText('N', MAP / 2 - 4, 12);
+  ctx.fillText(`${CONTOUR_STEP_FT} ft contours · max ${CONFIG.maxDepthFt} ft`, 6, MAP - 6);
+}
+
+function updateMinimap() {
+  if (mapEl.style.display === 'none') return;
+  mapCtx.clearRect(0, 0, MAP, MAP);
+  mapCtx.drawImage(mapBase, 0, 0);
+  // Smart bluegill dots, colored by state
+  for (const b of smartBluegill) {
+    const [bx, by] = worldToMap(b.mesh.position.x, b.mesh.position.z);
+    mapCtx.beginPath(); mapCtx.arc(bx, by, 3.5, 0, Math.PI * 2);
+    mapCtx.fillStyle = BG_COLORS[b.state]; mapCtx.strokeStyle = '#000';
+    mapCtx.fill(); mapCtx.stroke();
+  }
+
+  const [mx, my] = worldToMap(camera.position.x, camera.position.z);
+  mapCtx.save();
+  mapCtx.translate(mx, my);
+  mapCtx.rotate(-yaw); // yaw 0 = facing north (-z)
+  mapCtx.beginPath();
+  mapCtx.moveTo(0, -8); mapCtx.lineTo(5, 6); mapCtx.lineTo(0, 3); mapCtx.lineTo(-5, 6); mapCtx.closePath();
+  mapCtx.fillStyle = species === 'bass' ? '#ffd23f' : '#ff7a3f';
+  mapCtx.strokeStyle = '#000'; mapCtx.lineWidth = 1;
+  mapCtx.fill(); mapCtx.stroke();
+  mapCtx.restore();
+}
+
+// ---------------- Loop ----------------
+const clock = new THREE.Clock();
+renderer.setAnimationLoop(() => {
+  const dt = Math.min(clock.getDelta(), 0.05), t = clock.elapsedTime;
+  updatePlayer(dt);
+  updateFish(dt, t);
+  for (const b of smartBluegill) b.update(dt, t);
+  updateMsg(dt);
+  updateLateralLine(dt, t);
+  updateWeeds(t);
+  updateWaterColor();
+  updateHud();
+  updateMinimap();
+  renderer.render(scene, camera);
+});
+
+addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+  sizeLLEdge();
+});
+</script>
+</body>
+</html>
